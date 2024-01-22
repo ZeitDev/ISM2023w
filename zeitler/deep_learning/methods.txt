@@ -1,0 +1,3 @@
+Methods:
+
+Another architecture we investigated is a pretrained DenseNet called KimiaNet. It is trained on about 240,000 histopathological images of different cancer types provided by The Cancer Genome Atlas.about:blank#blockedabout:blank#blockedabout:blank#blocked

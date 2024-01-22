@@ -1,5 +1,9 @@
 # %%
 import os
+
+data_path = os.path.join('..', 'data', 'ISM')
+
+import os
 import csv
 import cv2
 import copy
@@ -12,6 +16,7 @@ from matplotlib import pyplot as plt
 
 import skimage
 from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score
+from sklearn.model_selection import RandomizedSearchCV
 
 import torch
 import torch.nn as nn
@@ -25,7 +30,6 @@ import torchvision.transforms as transforms
 
 from torch.utils.data import Dataset, DataLoader
 
-
 if torch.cuda.is_available():
     device = torch.device('cuda:0')
     torch.cuda.set_device(device)
@@ -33,85 +37,104 @@ if torch.cuda.is_available():
 else:
     device = torch.device('cpu')
     print('no GPU detected')
-print()
 
 # %% Settings
-BATCH_SIZE = 4 # 16
+isSubmission = False
+
+BATCH_SIZE = 8 # 16
 EPOCHS = 10 # 50
-LR = 0.01
+LR = 0.0002
 LOSS_FNC = nn.SmoothL1Loss()
 
-model = models.efficientnet_b7(num_classes = 4).to(device)
-model = model.to(device)
-optimizer = optim.Adam(model.parameters(), lr=LR)
-scheduler = StepLR(optimizer, step_size=6, gamma=0.35)
-
 SHUFFLE = True
-isTransform = True
-CENTER_CROP = (350, 350)
-RESIZE = (600, 600)
-TRAIN_SIZE = 0.6
-VAL_SIZE = 0.2
+CENTER_CROP = (500, 500)
+RESIZE = (224, 224)
+TRAIN_SIZE = 0.8
+VAL_SIZE = 0.1
 
 NUM_WORKERS = 0 # WINDOWS: 0, LINUX: 6
 PIN_MEMORY = False # WINDOWS: False, LINUX: True
 
-print(f'SETTINGS:\nbatch size = {BATCH_SIZE}\nepochs = {EPOCHS}\nlearning rate = {LR}\nloss function = {LOSS_FNC}\n\nmodel = {type(model)}\noptimizer = {type(optimizer)}\nscheduler = {type(scheduler)}\n\nshuffle = {SHUFFLE}\ntransform = {isTransform}\ncenter crop = {CENTER_CROP}\nresize = {RESIZE}\ntrain size = {TRAIN_SIZE}\nval size = {VAL_SIZE}\ntest size = {int(1-TRAIN_SIZE-VAL_SIZE)}\n\nnum workers = {NUM_WORKERS}\npin memory = {PIN_MEMORY}\n')
+# %%
+class fully_connected(nn.Module):
+    def __init__(self, model, num_ftrs):
+      super(fully_connected, self).__init__()
+      self.model = model
+      self.fc_4 = nn.Linear(num_ftrs, 30)
+      self.act_4 = nn.ReLU()
+      self.dropout_4 = nn.Dropout(0.5)
+      self.fc_5 = nn.Linear(30, 4)
 
-# %% Helper Functions
+    def forward(self, x):
+      x = self.model(x)
+      x = torch.flatten(x, 1)
+      x = self.fc_4(x)
+      x = self.act_4(x)
+      x = self.dropout_4(x)
+      x = self.fc_5(x)
+      return x
+
+pre_model = models.densenet121(pretrained=True)
+pre_model.features = nn.Sequential(pre_model.features, nn.AdaptiveAvgPool2d(output_size=(1,1)))
+model = fully_connected(pre_model.features, pre_model.classifier.in_features)
+model = model.to(device)
+model = nn.DataParallel(model)
+
+state_dict = torch.load(os.path.join(data_path, '..', 'KimiaNetPyTorchWeights.pth'))
+for name, param in model.named_parameters():
+    if name in state_dict:
+        param.data.copy_(state_dict[name])
+    else:
+        if 'fc_5' in name:
+            if 'weight' in name:
+                nn.init.kaiming_normal_(param.data)
+            elif 'bias' in name:
+                nn.init.constant_(param.data, 0.0)
+        else:
+            print(f"Ignoring parameter {name} as it is not in the state_dict.")
+
+for param in model.parameters():
+    param.requires_grad = True
+
+optimizer = optim.Adam(model.parameters(), lr=LR)
+scheduler = StepLR(optimizer, step_size=6, gamma=0.35)
+
+# %%
 class ISM_Dataset(Dataset):
-    def __init__(self, data_type, isTest=False):
-        self.isTest = isTest
-        self.image_location = os.path.join('..', 'data', 'ISM', data_type)
+    def __init__(self, data_type, isSubmission=False):
+        self.isSubmission = isSubmission
+        self.image_location = os.path.join(data_path, data_type)
         self.image_filenames = os.listdir(self.image_location)
-        
-        self.labels_location = os.path.join('..', 'data', 'ISM', data_type + '.csv')
 
-        self.labels = {}
-        with open(self.labels_location) as f:
-            csv_reader = csv.DictReader(f)
-            for row in csv_reader:
-                self.labels[row['name']] = int(row['label'])
+        self.labels_location = os.path.join(data_path, data_type + '.csv')
+
+        if not self.isSubmission:
+          self.labels = {}
+          with open(self.labels_location) as f:
+              csv_reader = csv.DictReader(f)
+              for row in csv_reader:
+                  self.labels[row['name']] = int(row['label'])
 
     def __len__(self):
         return len(self.image_filenames)
-    
+
     def __getitem__(self, index):
         name = os.path.splitext(self.image_filenames[index])[0]
-        if not self.isTest: 
+        if not self.isSubmission:
             label = self.labels[os.path.splitext(self.image_filenames[index])[0]]
             one_hot_label = torch.zeros(1, 4).squeeze(0)
             one_hot_label[label] = 1
+        else:
+          label = 99
+          one_hot_label = 99
 
         image = skimage.io.imread(os.path.join(self.image_location, self.image_filenames[index]))
-        if isTransform: image = transform(image)
-        
+        if not isSubmission:
+          image = data_transforms['train'](image)
+        else:
+          image = data_transforms['val'](image)
+
         return {'name': name, 'image': image, 'one_hot_label': one_hot_label, 'label': label}
-
-def get_mean_std(data_type):
-    print('\nCalculating mean and std...')
-    pretransform = transforms.Compose([
-                transforms.ToTensor(),
-                #transforms.CenterCrop(CENTER_CROP),
-                transforms.Resize(RESIZE)])
-
-    images_sum = torch.tensor([0.0])
-    images_sum_squared = torch.tensor([0.0])
-
-    image_location = os.path.join('..', 'data', 'ISM', data_type)
-    image_filenames = os.listdir(image_location)
-    for filename in tqdm(image_filenames):
-        image = skimage.io.imread(os.path.join(image_location, filename))
-        if isTransform: image = pretransform(image)
-
-        images_sum += image.sum()
-        images_sum_squared += (image ** 2).sum()
-
-    total_pixels = RESIZE[0] * RESIZE[1] * len(image_filenames)
-    mean = images_sum / total_pixels
-    std = torch.sqrt((images_sum_squared / total_pixels) - (mean ** 2))
-
-    return mean, std
 
 def get_metrics(labels, predictions):
     accuracy = round(100*accuracy_score(labels, predictions))
@@ -137,20 +160,28 @@ def get_metrics(labels, predictions):
     return accuracy, f1, recall, precision, splitted_metrics
 
 # %%
-#train_mean, train_std = get_mean_std('train')
-
-transform = transforms.Compose([
+data_transforms = {
+    'train': transforms.Compose([
             transforms.ToTensor(),
-            transforms.CenterCrop(CENTER_CROP),
-            transforms.Resize(RESIZE, antialias=True)])
-            #transforms.Normalize(train_mean, train_std)])
+            #transforms.RandomCrop(size=(CENTER_CROP[0], CENTER_CROP[1])),
+            #transforms.Resize(size=(RESIZE[0], RESIZE[1])),
+            transforms.RandomHorizontalFlip(0.5),
+            transforms.RandomVerticalFlip(0.5),
+            transforms.RandomRotation(45),
+            transforms.Normalize([0.647, 0.552, 0.669], [0.211, 0.250, 0.173])]),
+    'val': transforms.Compose([
+            transforms.ToTensor(),
+            #transforms.CenterCrop(size=(CENTER_CROP[0], CENTER_CROP[1])),
+            #transforms.Resize(size=(RESIZE[0], RESIZE[1])),
+            transforms.Normalize([0.647, 0.552, 0.669], [0.211, 0.250, 0.173])])}
 
 if 'train_dataset' not in locals():
-    dataset_lengths = [int(x * len(ISM_Dataset('train'))) for x in [TRAIN_SIZE, VAL_SIZE]]
-    dataset_lengths.extend([len(ISM_Dataset('train')) - sum(dataset_lengths)])
+    dataset = ISM_Dataset('train')
+    dataset_lengths = [int(x * len(dataset)) for x in [TRAIN_SIZE, VAL_SIZE]]
+    dataset_lengths.extend([len(dataset) - sum(dataset_lengths)])
     print(f'\nCreating datasets of sizes: train = {dataset_lengths[0]}, val = {dataset_lengths[1]}, test = {dataset_lengths[2]}')
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(ISM_Dataset('train'), [dataset_lengths[0], dataset_lengths[1], dataset_lengths[2]])
-    
+    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(dataset, [dataset_lengths[0], dataset_lengths[1], dataset_lengths[2]])
+
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=SHUFFLE, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=SHUFFLE, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=SHUFFLE, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
@@ -170,15 +201,15 @@ start = time.time()
 for epoch in range(EPOCHS):
     time_elapsed = time.time() - start
     print(f'Epoch = {epoch+1}/{EPOCHS} | Learning Rate = {scheduler.get_last_lr()[0]:.4f} | time = {time_elapsed // 60:.0f}:{time_elapsed % 60:.0f}')
-    print('-' * 40)
 
     for phase in ['train', 'val']:
         if phase == 'train': model.train()
         elif phase == 'val': model.eval()
-            
+
         running_loss = 0.0
         for data in dataloaders[phase]:
-            images, labels = data['image'].to(device), data['one_hot_label'].to(device)
+            images = data['image'].to(device)
+            labels = data['one_hot_label'].to(device)
 
             optimizer.zero_grad()
 
@@ -209,7 +240,18 @@ for epoch in range(EPOCHS):
 
 time_elapsed = time.time() - start
 print(f'Training completed in {time_elapsed // 60:.0f}:{time_elapsed % 60:.0f}s')
-print(f'Best validation loss: {best_loss:.4f} at epoch {best_model_epochs[-1]}/{EPOCHS}')
+print(f'Best validation loss: {best_loss:.8f} at epoch {best_model_epochs[-1]+1}/{EPOCHS}')
+
+# %%
+plt.plot(train_loss, label='Train Loss')
+plt.plot(val_loss, label='Validation Loss')
+
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Train and Validation Loss Over Epochs')
+
+plt.legend()
+plt.show()
 
 # %%
 print('Testing...')
@@ -234,3 +276,37 @@ print(f'\nAccuracy: {accuracy} \nF1: {f1} \nRecall: {recall} \nPrecision: {preci
 print()
 
 # %%
+if isSubmission:
+    submission_dataset = ISM_Dataset('test', isSubmission = True)
+    submission_loader = DataLoader(submission_dataset, batch_size=BATCH_SIZE, shuffle=SHUFFLE, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+
+    print('Submission...')
+    model.load_state_dict(best_model)
+
+    submission_names = []
+    submission_predictions = []
+
+    with torch.no_grad():
+        model.eval()
+        for data in tqdm(submission_loader):
+            images = data['image'].to(device)
+            outputs = model(images)
+            top_p, top_class = F.softmax(outputs, dim=1).topk(1, dim=1)
+
+            submission_predictions.extend([x[0] for x in top_class.cpu().tolist()])
+            submission_names.extend(data['name'])
+
+    results = {'names': [], 'labels': []}
+    with open(os.path.join(data_path, 'test.csv'), 'r') as f:
+        csv_reader = csv.DictReader(f)
+        for row in csv_reader:
+            results['names'].append(row['name'])
+            index = submission_names.index(row['name'])
+            results['labels'].append(submission_predictions[index])
+
+    with open(os.path.join(data_path, f'submission_{datetime.now().strftime("%H%M_%d%m%y")}.csv'), 'w', newline='') as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(['name', 'label'])
+        for i in range(len(results['names'])):
+            csv_writer.writerow([results['names'][i], results['labels'][i]])
+
